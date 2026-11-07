@@ -114,12 +114,60 @@ def match_jobs(state: JobHunterState) -> dict[str, Any]:
     profile = state.get("candidate_profile", {}) or {}
     candidate_skills = set(profile.get("skills", []))
     matched = []
+    errors = list(state.get("errors", []))
     for job in state.get("extracted_jobs", []):
         job_skills = set(job.get("skills", []))
         overlap = sorted(candidate_skills & job_skills)
         semantic = len(overlap) / max(1, len(job_skills)) if candidate_skills else 0.0
+        # The optional LLM adds semantic relevance to the local skill overlap.
+        # Candidate text is only sent to Groq when the user configured an API key.
+        if profile.get("available") and settings.GROQ_API_KEY:
+            try:
+                semantic = _groq_match(profile, job)
+            except Exception as exc:
+                errors.append(f"Matching Groq indisponible; score local utilisé ({type(exc).__name__}).")
         matched.append({**job, "matching_skills": overlap, "skill_match": semantic, "cv_available": bool(profile.get("available"))})
-    return {"matched_jobs": matched}
+    return {"matched_jobs": matched, "errors": errors}
+
+
+def _groq_client():
+    from openai import OpenAI
+    if not settings.GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY n’est pas configurée")
+    return OpenAI(api_key=settings.GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=30)
+
+
+def _groq_match(profile: dict, job: dict) -> float:
+    response = _groq_client().chat.completions.create(
+        model=settings.GROQ_MODEL,
+        temperature=0,
+        max_completion_tokens=256,
+        extra_body={"include_reasoning": False},
+        messages=[
+            {"role": "system", "content": "Évalue la compatibilité compétences et expérience entre candidat et offre. Réponds uniquement par un nombre entre 0 et 1."},
+            {"role": "user", "content": f"Profil candidat:\n{profile.get('text', '')[:8000]}\n\nOffre:\n{job.get('title', '')}\n{job.get('description', '')[:5000]}"},
+        ],
+    )
+    raw = response.choices[0].message.content.strip()
+    match = re.search(r"(?:0(?:\.\d+)?|1(?:\.0+)?)", raw)
+    if not match:
+        raise ValueError("Réponse du modèle non numérique")
+    return min(1.0, max(0.0, float(match.group(0))))
+
+
+def test_groq_connection() -> str:
+    """Make a minimal live API call without sending CV or job data."""
+    response = _groq_client().chat.completions.create(
+        model=settings.GROQ_MODEL,
+        temperature=0,
+        max_completion_tokens=128,
+        extra_body={"include_reasoning": False},
+        messages=[{"role": "user", "content": "Réponds exactement: GROQ_OK"}],
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("Groq a répondu sans texte ; vérifiez les limites du compte et réessayez.")
+    return content.strip()
 
 
 def score_jobs(state: JobHunterState) -> dict[str, Any]:
@@ -140,7 +188,7 @@ def score_jobs(state: JobHunterState) -> dict[str, Any]:
 
 def generate_report(state: JobHunterState) -> dict[str, Any]:
     jobs = state.get("ranked_jobs", [])
-    lines = ["# Rapport quotidien – recherche de stages", "", f"Offres analysées : {len(jobs)}", ""]
+    lines = ["# Rapport quotidien – recherche de stages", "", f"Offres analysées : {len(jobs)} (Offers analyzed: {len(jobs)})", ""]
     if not state.get("candidate_profile", {}).get("available"):
         lines.extend(["_Aucun CV n’a été fourni : les scores reflètent le type de poste et la localisation, sans comparaison de compétences._", ""])
     if not jobs:
